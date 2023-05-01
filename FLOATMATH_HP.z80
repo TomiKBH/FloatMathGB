@@ -1,0 +1,2665 @@
+;**********************************************************
+;*     Floating-Point Math Package for GameBoy or Z80     *
+;**********************************************************
+
+;*******************************************************************************************************************************************************************
+;last edit: 18-Nov-2021
+; by Tomi
+
+; Version 1.3	-	Converted to RGBDS 0.3.7 syntax
+;					Made compatible with rgbds 0.4.1: load is a reserved keyword in RGBDS 0.4.1 --> changed label "load" (and its calls) to "load0"
+;					Exported astka and FP_SIZE ; WARNING! EQU EXPORT WORKS ONLY FROM RGBDS 0.4.1
+;					Replaced ex de,hl  by EXDEHL macro	(ex de,hl does not exist in GBZ80 instruction set)
+;					Fixed ComputeMult	inserted "BYTE shiftintobuf" BEFORE buf, inserted "BYTE fmulcounter" AFTER hold8;
+;										("BYTE erri" was used for 3 different purposes simultaneously  (!!! WoooHooo !!!) and generated conflict/lockup)
+;										(1. counter in fmul9 / 2. shift data into buf in fmu12 / 3. error flag on underflow)
+;					Fixed ComputeSine	inserted push af & pop af in sin5 / inserted push af & pop af 2 times in mul10
+;										in quadc (Quadrant Computing): error handling was missing --> inserted ret c (carry set = error) after call PopFix
+;										(max value for PopFix input is 65535 (tos=int[x*2/pi]) as PopFix must return the same value in de (16 bits)
+;										Error handlig continues after call quadc in ComputeSine (inserted jr nc,.next pop hl (put back sp on track) ret c and .next label
+;										Note that max input for sine fuction is int(65536/(2/Pi))< 102943.7081 ; Above this value quadrant calculation is wrong --> quadc returns error
+;					Fixed ComputeTan	added error handling: added ret c after call ComputeCosine ; then added error handling for cos x = 0 (tan x = sin x / cos x , so div by 0 is not allowed
+;										Note that max input for cosine and fuctions is < 102942.1373 . (That is an offset of Pi/2 relative to max input of sine function)
+;					Fixed StringToFP	inserted push af & pop af in ibscn2 / suppressed ld a,b in botm
+;										in asc2	replaced rla / jr c,fperr with cp a,127 / jr nc,fperr (this generated a lockup when exponent was 127) max exp is 126 !!!
+;										in bpos1 replaced cp 128 with cp 126 this checks exp + integer length (if exp is positive) or exp + leading zeroes length (if exp is negative)
+;										max exp is 126 ;
+;										! NOTE: max integer length or max leading zeroes length is 15 as second nibble of [ecnt] is used as counter
+;										! NOTE: first nibble is either 0 ; C or 8 depending on: presence of leading zeroes and presence of decimal point
+;										in chkpn replaced call bpos1 with jr bpos1 (SP off track error)
+;										in bpos1 added pop af (SP was off track)
+;					Fixed FPToString	replaced jp zeroc with call chout & jp TermStr in xo4 ;in exponential string output exponent was printed with a trailing zero
+;										at the beginning added a loop that zeroes mantissa if exp = 0
+;										when NUMBER ZERO (exponent 0) mantissa need also to be reset (resetting exp is not sufficient otherwise garbage will be displayed with FPtoString)
+;					Fixed ComputeInt	when NUMBER ZERO (exponent 0) mantissa need also to be reset (resetting exp is not sufficient otherwise fadd and fsub calculations will be wrong)
+;					Fixed over and divz	replaced jp Error by jp PopError ; stack pointer was off track
+;					Fixed fpetst		carry flag must be preserved through fpetst when no underflow (erri=0)
+;										carry flag must be reset when underflow (erri !=0))
+;										on erri result is zeroed
+;					Fixed stor1/ads2	carry must be reset on exit from stor1 (or on entering ads2)(carry flag=set would mean error in calculation)
+;										(prog contains several jumps to ads2 with carry set (for example ads9);
+;										(on calculation error the prog does not go through stor1/ads2 anyways)
+;					exponent			replaced "e" with "E" in ndec and scang to avoid confusion with Euler's number (e=2.718281828)
+;					pri21				now jumps to prin3 instead of prin4 (added prin3 label). Prints a leading zero before decimal point if result is between -1 and 1
+;										example: output string is now 0.75 instead of .75
+;					Exported several labels ( :: )
+;					Modified comments in sinx and cosx Taylor coefficient tables (added "!" (for factorial))
+;					Modified ComputeMult comment (* was -)
+;					Added some comments
+;					Modified comments in ComputeAdd ComputeSub ComputeMul ComputeDiv
+;						from "Replace top two arguments on stack with result." to "Replace argument first put on stack with result."
+;					
+;					Added RAM allocation printout
+;
+;					Replaced all occurrences of "PERCISION" and "percision" with "PRECISION" and "precision"
+;					Increased PRECISION from 6 to 10 and modified constants table values accordingly
+;					ComputeSqrRoot		Increased Newton iterations count from 6 to 8		(6 was not sufficient when computing SqrRoot(1) for example)
+;					
+;					ADDITIONAL NOTES:
+;					ALL MODIFICATIONS THAT I HAVE MADE ARE COMMENTED WITH "; MODIF !!!!!!!!!!!!!!!"
+;						(except for MACROS and floating point RAM alloc and its printout as they are RGBDS-specific anyways)
+;					THE NUMBER ZERO IS REPRESENTED BY THE EXPONENT 0 AND MANTISSA 0
+;					TAYLOR COEFFICIENTS COUNT MUST BE EVEN BECAUSE HORNER'S METHOD IS USED
+;					TRIGONOMETRIC FUNCTION INPUT IN RADIANS
+;					%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+;					%	Input values and computed values must be within range	  %
+;					%		1e-126 < abs(X) < 1e+126							  %
+;					%				(or X = 0)									  %
+;					%		For sine function abs(X) < 102943.7081				  %
+;					%		For cosine & tan functions abs(X) < 102942.1373		  %
+;					%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+;*******************************************************************************************************************************************************************
+
+
+
+; original version by Jeff Frohwein http://www.devrs.com/gb/files/math.zip
+
+
+;----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+;                               		INCLUDES
+;----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+;----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+;                               		CONSTANTS
+;----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+PRECISION	EQU	10            		;This is the floating precision in digits.
+									;It should be an even number because the
+                              		;floating point routines can't handle odd.
+                              		;Increasing it's size increases precision
+                              		;but is slower & requires more ram usage.
+                              		;IF YOU MODIFY THIS VALUE, MODIFY CONSTANTS
+                              		;TABLE VALUES AS WELL.
+
+FP_SIZE		EQU	(PRECISION/2)+2     ;Size in bytes of a fp number
+DIGIT		EQU PRECISION/2
+
+CR			EQU	13					;carriage return
+
+
+
+									; !!!!! STORAGE IN WRAM NEED ALSO TO BE RESERVED ; the below are only PARAMETRABLE symbol equates !!!!!
+									; symbol equates depend on PRECISION --> memory allocation is parametrable and reserved block size changes following PRECISION
+									; !!!!! rambase0: MUST MATCH WITH WRAM SECTION !!!!!
+rambase0	set	$c300
+rambase		set	rambase0			;beginning of RAM location
+FP_STACK	set	20					;floating point stack size (x FP_SIZE)
+
+
+
+BYTE: MACRO
+\1 = rambase
+rambase set rambase + 1
+ENDM
+
+WORD: MACRO
+\1 = rambase
+rambase set rambase + 2
+ENDM
+
+BLOCK: MACRO
+\1 = rambase
+rambase set rambase + \1
+ENDM
+
+BLOCK_L: MACRO
+rambase set rambase + \2
+\1 = rambase + -1												; MODIF !!!!!!!!!!!!!!! kept RGBDS 0.3.7 compatibility: it cannot subtract from symbol even if symbols are constant (known at assembly time). A NEGATIVE NUMBER MUST BE ADDED !!!!!	
+ENDM
+
+L_BLOCK: MACRO
+\1 set rambase
+rambase set rambase + \2
+ENDM
+
+LABEL: MACRO
+\1 = rambase
+ENDM
+
+
+EXDEHL: MACRO	
+	push de
+	ld d,h
+	ld e,l
+	pop  hl
+	ENDM
+
+
+; ;
+; ;	floating point ram
+; ;
+
+; ;Used in Add, Subtract, Multiply, & Divide routines
+	L_BLOCK hold1,(DIGIT+1)
+	L_BLOCK hold2,(DIGIT+1)
+	L_BLOCK hold3,(DIGIT+1)	
+	L_BLOCK hold4,(DIGIT+1)	
+	L_BLOCK hold5,(DIGIT+1)	
+	L_BLOCK hold6,(DIGIT+1)	
+	L_BLOCK hold7,(DIGIT+1)	
+	L_BLOCK hold8,(DIGIT+1)	
+	BYTE fmulcounter											; MODIF !!!!!!!!!!!!!!! in MULTIPLICATION "erri" was used for 3 diff purposes: error flag, counter and byte that rotates data into buf !!!!! --> needed to allocate 2 more bytes
+	BYTE erri					;error flag
+	BYTE shiftintobuf											; MODIF !!!!!!!!!!!!!!! in MULTIPLICATION "erri" was used for 3 diff purposes: error flag, counter and byte that rotates data into buf !!!!! --> needed to allocate 2 more bytes
+	L_BLOCK buf,FP_SIZE			;working buffer
+sign	EQU	buf+DIGIT			;sign bit
+exp		EQU buf+DIGIT+1			;exponent
+
+	BYTE	rctrl				;rounding control flag 1=msd
+	BYTE	rdigi				;rounding digit
+signd	EQU	hold1+DIGIT
+expd	EQU hold1+DIGIT+1
+
+	BLOCK_L	fpsink,FP_SIZE
+	BLOCK_L	ftemp,FP_SIZE
+	BLOCK_L	ftem1,FP_SIZE
+	BLOCK_L	ftem2,FP_SIZE
+
+;Floating Point Stack Variables
+	WORD	astka
+ASTKSZ EQU	FP_SIZE * FP_STACK
+	L_BLOCK	astkl,ASTKSZ
+
+;Used by StringToFP routine
+	WORD	adds
+	WORD	bcadd
+	BYTE	opst
+	BYTE	ecnt
+	L_BLOCK	bcs,DIGIT+2
+
+;Used by FPToString routine
+	WORD	addt
+	BYTE	fsign
+abufsiz EQU	PRECISION+5
+	L_BLOCK	abuf,abufsiz
+	BYTE	expo
+	BYTE	fes
+	BYTE	infes
+	WORD	outptr
+
+;Used by StringToFP & FPToString routines
+	L_BLOCK	cnsbuf,(PRECISION+8)
+	BYTE	xsign
+
+;Used by PopFix & CNS routine
+	WORD	miscW1
+
+
+;PRINT OUT RAM ALLOCATION:										; MODIF !!!!!!!!!!!!!!!
+PRINTV hold1
+PRINTT " hold1\n"
+PRINTV hold2
+PRINTT " hold2\n"
+PRINTV hold3
+PRINTT " hold3\n"
+PRINTV hold4
+PRINTT " hold4\n"
+PRINTV hold5
+PRINTT " hold5\n"
+PRINTV hold6
+PRINTT " hold6\n"
+PRINTV hold7
+PRINTT " hold7\n"
+PRINTV hold8
+PRINTT " hold8\n"
+PRINTV fmulcounter
+PRINTT " fmulcounter\n"
+PRINTV erri
+PRINTT " erri\n"
+PRINTV shiftintobuf
+PRINTT " shiftintobuf\n"
+
+PRINTV buf
+PRINTT " buf\n"
+PRINTV sign
+PRINTT " sign\n"
+PRINTV exp
+PRINTT " exp\n"
+
+PRINTV rctrl
+PRINTT " rctrl\n"
+PRINTV rdigi
+PRINTT " rdigi\n"
+PRINTV signd
+PRINTT " signd\n"
+PRINTV expd
+PRINTT " expd\n"
+
+PRINTV fpsink
+PRINTT " fpsink\n"
+PRINTV ftemp
+PRINTT " ftemp\n"
+PRINTV ftem1
+PRINTT " ftem1\n"
+PRINTV ftem2
+PRINTT " ftem2\n"
+
+PRINTV astka
+PRINTT " astka\n"
+PRINTV astkl
+PRINTT " astkl\n"
+
+PRINTV adds
+PRINTT " adds\n"
+PRINTV bcadd
+PRINTT " bcadd\n"
+PRINTV opst
+PRINTT " opst\n"
+PRINTV ecnt
+PRINTT " ecnt\n"
+PRINTV bcs
+PRINTT " bcs\n"
+
+PRINTV addt
+PRINTT " addt\n"
+PRINTV fsign
+PRINTT " fsign\n"
+PRINTV abuf
+PRINTT " abuf\n"
+PRINTV expo
+PRINTT " expo\n"
+PRINTV fes
+PRINTT " fes\n"
+PRINTV infes
+PRINTT " infes\n"
+PRINTV outptr
+PRINTT " outptr\n"
+
+PRINTV cnsbuf
+PRINTT " cnsbuf\n"
+PRINTV xsign
+PRINTT " xsign\n"
+
+PRINTV miscW1
+PRINTT " miscW1\n"
+
+
+EXPORT astka													; WORKS ONLY FROM RGBDS 4.1.0
+EXPORT FP_SIZE													; WORKS ONLY FROM RGBDS 4.1.0
+
+
+;****************************************************************************************************************************************************************************
+SECTION "FLOATMATHRAM", WRAM0[rambase0]
+;****************************************************************************************************************************************************************************
+
+FloatMathRam::	DS	rambase-rambase0
+
+TempFPSTART::	DS	(FP_SIZE + -1)		; Reserve FP_SIZE bytes for temporary storage.
+TempFP::		DB						; Point to last byte of FP storage
+;----------------------------------------------------------------------------------------
+
+StringOut::								; '-3.14159e+128',0
+DS	PRECISION+8							; Reserve (PRECISION+8) bytes for return ascii string.
+
+
+
+;****************************************************************************************************************************************************************************
+SECTION "FLOATMATH", ROMX
+;****************************************************************************************************************************************************************************
+
+
+
+
+EX_SPHL: MACRO
+	push de
+	di
+	add sp,2
+	pop de
+	push hl
+	ld l,e
+	ld h,d
+	add sp,-2
+	ei
+	pop de
+ENDM
+
+; Initialize values needed by math package.
+InitializeFP::
+        ld      a,2*PRECISION
+        ld      [infes],a
+
+        ld      hl,astkl+ASTKSZ+FP_SIZE-1
+        ld      a,l
+        ld      [astka],a
+        ld      a,h
+        ld      [astka+1],a
+		ret
+;
+; Setup arguments for Add, Sub, Mult, & Div.
+;
+GetArgAddr:
+        ld      a,[astka]
+        ld      e,a
+        ld      a,[astka+1]
+        ld      d,a
+
+        ld      hl,FP_SIZE		;Pop one argument off stack
+        add     hl,de
+
+        ld      a,l
+        ld      [astka],a
+        ld      a,h
+        ld      [astka+1],a
+        ld      b,h
+        ld      c,l             ;bc = ptr to arg1
+
+        EXDEHL           		;hl = ptr to arg2
+        ld      d,b             ;de = ptr to arg1
+        ld      e,c
+        ret
+;
+; Return result of addition of top two stack arguments.
+; Replace argument first put on stack with result.
+;
+ComputeAdd::
+        call    GetArgAddr
+aadd1:	call	fadd
+        jr      fpetst
+;
+; Return result of subtraction of top two stack arguments.
+; Replace argument first put on stack with result.
+; [In X = Y - Z, argument first put on stack is Y.]
+;
+ComputeSub::
+		call	GetArgAddr
+asub1:	call	fsub
+		jr		fpetst
+;
+; Return result of multiplication of top two stack arguments.
+; Replace argument first put on stack with result.
+; [In X = Y * Z, argument first put on stack is Y.]
+;
+ComputeMult::
+        call    GetArgAddr
+amul1:	call	fmul
+        jr      fpetst
+;
+; Return result of division of top two stack arguments.
+; Replace argument first put on stack with result.
+; [In X = Y / Z, argument first put on stack is Y.]
+;
+ComputeDiv::
+        call    GetArgAddr
+adiv1:	call	fdiv
+
+fpetst: push	af												; MODIF !!!!!!!!!!!!!!! PRESERVE CARRY FLAG (carry flag set = error in calculation) (except underflow: underflow is not considered as an error, result is zeroed instead
+		ld      a,[erri]     	;Error during calculation?		; !!!!! erri only records underflow !!!!!
+		or		a													
+        jp		z,.end											; MODIF !!!!!!!!!!!!!!! NO UNDERFLOW, skip underflow handling and go to end (then restore carry flag)
+		;ret     z            	;No								; MODIF !!!!!!!!!!!!!!!
+
+        ld      a,[astka]		;Zero result on underflow
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+        ld      [hl],0
+
+		pop af													; MODIF !!!!!!!!!!!!!!! PUT BACK SP ON TRACK 
+		and a													; MODIF !!!!!!!!!!!!!!! AND RESET CARRY FLAG (UNDERFLOW IS NOT CONSIDERED AS AN ERROR, RESULT IS ZEROED INSTEAD
+		ret														; MODIF !!!!!!!!!!!!!!! EXIT WITH CARRY FLAG RESET
+.end															; MODIF !!!!!!!!!!!!!!!
+		pop af													; MODIF !!!!!!!!!!!!!!! RESTORE CARRY FLAG
+		
+		
+		
+		ret
+;
+; Replace what's on stack with it's negative
+;
+ComputeNeg::
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        ld      a,[hl]
+        or      a              ;is it 0?
+        ret     z              ;yes, can't negate zero
+        dec     hl             ;Invert sign of number
+		ld		a,[hl]
+		xor		1
+        ld      [hl],a
+        ret
+;
+; Replace what's on stack with it's absolute
+;
+ComputeAbs::
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        dec     hl
+        ld      [hl],0
+        ret
+;
+; Replace what's on stack with it's sign [1 or -1]
+;
+ComputeSign::
+        ld      a,[astka]
+        ld      e,a
+        ld      a,[astka+1]
+        ld      d,a
+        dec     de
+        ld      a,[de]
+        inc     de
+		or		a
+		ld		hl,fpone
+        jp      z,vcopy
+
+		ld		hl,fpnone
+		jp		vcopy
+;
+;	compute sin[x] x=top of argument stack
+;	return result in place of x
+;
+ComputeSine::
+        call    quadc       ;compute quadrant
+		jr		nc,.next										; MODIF !!!!!!!!!!!!!!!
+		pop		hl												; MODIF !!!!!!!!!!!!!!! put back sp on track
+		ret		c												; MODIF !!!!!!!!!!!!!!! then return if error
+.next															; MODIF !!!!!!!!!!!!!!!
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		ld		d,h
+		ld		e,l
+		ld		bc,ftemp
+		call	amul1	    ;ftemp=x*x
+		pop		af
+		push	af	     	;a=quadrant
+		rra	
+        jr      c,sin10     ;quad odd, compute cosine
+
+;  compute x*p[x*x] -- sine
+		ld		de,ftem1
+
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		call	vcopy	    ;ftem1=x*x
+		ld		bc,sinx
+		call	poly	    ;p[x*x]
+		call	PrepOp
+		ld		hl,ftem1
+		call	amul1	    ;x*p[x*x]
+
+;   compute sign of result
+; positive for quadrants 0,1. negative for 2,3
+; negate above for negative arguments
+sin5:	pop		af	     	;quadrant
+		ld		b,a
+		pop		af	     	;sign
+		rlca		     	;sign, 2 to the 1st bit
+		xor		b	     	;quadrant, maybe modified for negative arg.
+
+		push	af												; MODIF !!!!!!!!!!!!!!!
+		ld      a,[astka]
+		ld      l,a
+		ld      a,[astka+1]
+		ld      h,a
+		pop		af												; MODIF !!!!!!!!!!!!!!!
+
+		dec		hl	     	;ptr to sign
+		sub		2
+        cp      128
+        ret     nc          ;quadrant 0 or 1
+		inc		[hl]	    ;else set result negative
+        or      a           ;clear carry flag
+		ret
+
+; compute p[x*x] -- cosine
+sin10:	ld		bc,cosx
+		call	poly	    ;p[x*x]
+        jr      sin5
+;
+;    compute cos[x] x=top of argument stack
+; return result in place of x
+; cos[x]=sin[x+pi/2]
+;
+ComputeCosine::
+        call    PrepOp
+		ld		hl,pic2	    ;pi/2
+		call	aadd1	    ;tos=tos+pi/2
+        jp      ComputeSine
+;
+;    compute tan[x] x=top of argument stack
+; return result in place of x
+; tan[x]=sin[x]/cos[x]
+;
+ComputeTan::
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        call    PushArgument   ;push copy of x onto arg stack
+        call    ComputeCosine  ;cos[x]
+		ret		c												; MODIF !!!!!!!!!!!!!!! error handling
+		ld      a,[astka]										; MODIF !!!!!!!!!!!!!!!
+        ld      l,a												; MODIF !!!!!!!!!!!!!!!
+        ld      a,[astka+1]										; MODIF !!!!!!!!!!!!!!!
+        ld      h,a												; MODIF !!!!!!!!!!!!!!!
+		ld		a,[hl]											; MODIF !!!!!!!!!!!!!!! MUST ALSO EXIT RET WITH ERROR CODE (C SET) WHEN Cosine result =0
+		and		a												; MODIF !!!!!!!!!!!!!!! (Tan X = Sin X / cos X ; Div by 0 not allowed)
+		jr		nz,.next										; MODIF !!!!!!!!!!!!!!!
+		scf														; MODIF !!!!!!!!!!!!!!!
+		ret														; MODIF !!!!!!!!!!!!!!!
+.next															; MODIF !!!!!!!!!!!!!!!
+
+		ld		de,ftem2
+        call    popa1          ;ftem2=cos[x]
+        call    ComputeSine
+        call    PrepOp
+		ld		hl,ftem2
+		jp		adiv1	     ;sin[x]/cos[x]
+;
+;    compute sqr[x] x=top of argument stack
+; return result in place of x
+;
+ComputeSqrRoot::
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		ld		de,ftemp
+		call	vcopy	     ;save x in ftemp
+
+; compute exponent of first guess as exponent of x/2
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		ld		a,[hl]
+		or		a
+		ret		z	     	;x=0
+
+        sub     128
+        cp      128
+        jr      nc,sqr5       ;negative exponent
+
+		rrca
+		and		127
+        jr      sqr6
+
+sqr5:	cpl	
+		inc		a
+		rrca	
+		and		127
+		cpl	
+        inc     a
+sqr6:
+        add     a,128
+        ldd     [hl],a
+
+; test for negative argument
+		ld		a,[hl]
+		or		a
+        jp      nz,Error     ;neg argument
+
+; do newton iterations
+; newguess =[ x/oldguess + oldguess ] /2
+		ld		a,8     	;do x iterations					; MODIF !!!!!!!!!!!!!!! 8 instead of 6; bcs QqrRoot(1) did not give good result !!!!!!!!!!!!!!!!!!!!
+sqr20:	push	af	     	;set new iteration count
+		ld		bc,ftem1
+		ld		de,ftemp    ;ftemp is "x"
+
+        ld      a,[astka]   ;guess
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		call	adiv1	    ;ftem1=x/guess
+		ld		de,ftem1
+
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		ld		b,h
+		ld		c,l
+		call	aadd1		;tos=[x/guess]+guess
+        call    PrepOp
+		ld		hl,fptwo
+		call	adiv1	    ;tos=[x/guess+guess]/2
+		pop		af
+		dec		a		    ;decrement count
+        jr      nz,sqr20	;do another iteration
+		ret	
+
+;Set carry flag & return
+
+PopError:
+        pop     af
+Error:  scf
+		ret
+;
+;   evaluate p[x] using horners method [x is in ftemp]
+; coefficient list pointer is in bc
+; result replaces number on top of argument stack [y]
+poly:   ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        EXDEHL        		;de=ptr to y
+
+		ld		h,b
+		ld		l,c	     	;hl ptr to coefficient list
+		call	vcopy		;y=first coefficient
+
+; multiply by x
+poly1:	push	hl	     	;save coeff list pointer
+        call    PrepOp
+		ld		hl,ftemp
+		call	amul1	    ;y=y*x
+
+; add next coeff
+        call    PrepOp
+		pop		hl
+		push	hl	     	;hl=coeff. list pointer
+		call	aadd1	    ;y=y+coeff.
+
+; bump pointer to next coefficient
+		pop		hl	     	;coeff. pointer
+        ld      bc,-FP_SIZE-1
+		add		hl,bc		;next coef sign
+        ldi     a,[hl]
+        cp      128
+        jr      c,poly1     ;process next coefficient
+		ret		     		;negative sign [-1] - ends list
+;
+; prepare for operation
+;
+PrepOp: ld      a,[astka]
+        ld      e,a
+        ld      a,[astka+1]
+        ld      d,a
+
+		ld		b,d
+		ld		c,e
+		ret	
+;
+;     quadrant computation
+; pops top of argument stack
+; compute/gets sine of argument, quadrant of argument
+; and index into quadrant
+;
+;    exits with:
+; sp pointing to quadrant, mod 4
+; sp+2 pointing to sign of argument
+; top of argument stack has index into quadrant
+quadc:  ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		dec		hl		     ;point to sign
+		ld		b,[hl]
+		xor		a
+		ld		[hl],a	     ;arg. sign=0
+		ld		h,b
+
+        pop     de           ;pop return addr
+        push    hl           ;put sign on stack
+        push    de           ;push return
+
+; compute quadrant of abs[x]
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        call    PushArgument ;put copy of arg. onto stack
+        call    PrepOp
+		ld		hl,pic1	     ;2/pi
+		call	amul1	     ;tos=x*2/pi
+        call    ComputeInt   ;tos=int[x*2/pi]
+
+        ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        call    PushArgument ;another copy
+        call    PopFix       ;pop tos to de
+		ret		c												; MODIF !!!!!!!!!!!!!!!
+		ld		a,e
+		push	af			;quadrant
+		call    PrepOp
+		ld		hl,pic2
+		call	amul1	    ;tos=int[x*2/pi]
+		ld		de,ftemp
+		call	popa1	    ;ftemp=tos
+		call    PrepOp
+		ld		hl,ftemp
+		call	asub1		;tos=tos-ftemp
+		pop		af	     	;a=quadrant, low order byte
+		and		3	     	;mod 4
+		pop		hl
+		push	af	     	;save quadrant on stack
+		jp		hl	     	;return
+
+;
+;   int function action routine
+;
+ComputeInt::
+        call    PrepOp
+aint:
+		ld		a,[bc]
+		sub		129
+        cp      128
+        jr      c,aint1
+
+; zero if value less than one
+		xor		a
+		ld		[bc],a
+		
+		xor		a												; MODIF !!!!!!!!!!!!!!! RESETTING EXP IS NOT SUFFICIENT FOR ComputeAdd and ComputeSub (MANTISSA ALSO NEEDS TO BE ZEROED)
+		ld h,b													; MODIF !!!!!!!!!!!!!!! -"-
+		ld l,c													; MODIF !!!!!!!!!!!!!!! -"-
+		ld		b,FP_SIZE										; MODIF !!!!!!!!!!!!!!! -"-
+.loop	ldd		[hl],a											; MODIF !!!!!!!!!!!!!!! -"-
+		dec		b												; MODIF !!!!!!!!!!!!!!! -"-
+		jr		nz,.loop										; MODIF !!!!!!!!!!!!!!! -"-
+
+		ret	
+
+; exp > 0
+aint1:  sub     PRECISION-1
+		ret		nc
+		ld		d,a	     ;count
+		dec		bc
+aint2:	dec		bc
+		ld		a,[bc]
+		and		$F0
+		ld		[bc],a
+		inc		d
+		ret		z
+		xor		a
+		ld		[bc],a
+		inc		d
+        jr      nz,aint2
+		ret	
+;
+;   copys FP_SIZE bytes at addr hl to addr de
+; on exit hl points to adr-1 of last byte copied
+;
+vcopy::	ld      c,FP_SIZE
+vcop1:  ldd     a,[hl]
+		ld		[de],a
+		dec		de
+		dec		c
+        jr      nz,vcop1
+		ret	
+;
+; push value addr by hl onto arg stack
+;
+PushArgument::
+        ld      e,l
+        ld      d,h
+psha1:  ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+        ld      bc,-FP_SIZE
+		add		hl,bc
+
+        ld      a,l
+        ld      [astka],a     ;dec arg stack pointer
+        ld      a,h
+        ld      [astka+1],a
+
+        EXDEHL         			;exchange de & hl
+
+        jr      vcopy
+;
+;   pop arg stack
+; hl contains addr to put popped value at
+;
+PopArgument::
+        EXDEHL
+popa1:  ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+
+		push	hl
+        ld      bc,FP_SIZE
+		add		hl,bc
+
+        ld      a,l
+        ld      [astka],a     ;inc stack pointer
+        ld      a,h
+        ld      [astka+1],a
+
+		pop		hl
+		jp		vcopy
+;
+; fix floating to positive integer
+; return integer value in de
+; fp value from top of arg stack, pop arg stack
+;
+PopFix: ld      a,[astka]
+        ld      l,a
+        ld      a,[astka+1]
+        ld      h,a
+		ld		b,h
+		ld		c,l
+		push	hl
+		call	aint
+		ld		hl,fpsink
+        call    PopArgument
+		pop		hl
+		ld		c,[hl]	     ;exponent
+		dec		hl
+		ld		a,[hl]	     ;sign
+		or		a
+        jp      nz,Error     ;negative no good
+
+        ld      de,-FP_SIZE+1
+		add		hl,de
+		ld		de,0
+		ld		a,c
+		or		a
+		ret		z
+
+		dec		c	     ;set up for loop close test
+pfix4:	inc		hl
+		ld		a,[hl]
+		rrca	
+		rrca	
+		rrca	
+		rrca	
+		call	mul10
+        ret     c        ;error
+
+		dec		c
+        ld      a,c
+        cp      128
+        ccf
+        ret     nc       ;return if C is positive
+
+		ld		a,[hl]
+		call	mul10
+        ret     c        ;error
+
+		dec		c
+        ld      a,c
+        cp      128
+        jr      nc,pfix4 ;jump if C is negative
+
+        or      a        ;clear carry flag
+		ret
+;
+; take next digit in a [mask to $0F], accumulate to de
+;
+mul10:	push	af												; MODIF !!!!!!!!!!!!!!!
+		ld      a,l
+        ld      [miscW1],a
+        ld      a,h
+        ld      [miscW1+1],a
+		pop		af												; MODIF !!!!!!!!!!!!!!!
+	
+		ld		h,d			;get original value in hl
+		ld		l,e
+		add		hl,hl	    ;double it
+		ret		c
+		add		hl,hl	    ;quaddruple it
+		ret		c
+		add		hl,de	    ;add original for result of 5 x
+		ret		c
+		add		hl,hl	    ;result is 10 x
+		ret		c
+
+        EXDEHL
+		push	af												; MODIF !!!!!!!!!!!!!!!
+	    ld      a,[miscW1]
+        ld      l,a
+        ld      a,[miscW1+1]
+        ld      h,a
+		pop		af												; MODIF !!!!!!!!!!!!!!!
+	
+		and		$0F
+        add     a,e
+		ld		e,a
+		ld		a,d
+        adc     a,0            ;propogate the carry
+		ld		d,a
+		ret	
+
+;Terminate ascii string
+TermStr:
+        ld      b,0
+;Add ascii character in b to FP string output
+chout:  push    af
+        push    hl
+        ld      a,[outptr]
+        ld      l,a
+        ld      a,[outptr+1]
+        ld      h,a
+        ld      [hl],b
+        inc     hl
+        ld      a,l
+        ld      [outptr],a
+        ld      a,h
+        ld      [outptr+1],a
+        pop     hl
+        pop     af
+        ret
+;
+;       Output fp number addr by hl
+;       to an ascii string pointed to de.
+;
+FPToString::
+		ld		a,[hl]											; MODIF !!!!!!!!!!!!!!! -"-
+		or		a	     ;exponent zero?						; MODIF !!!!!!!!!!!!!!! -"-
+        jr		nz,.next										; MODIF !!!!!!!!!!!!!!! -"-
+		push	hl												; MODIF !!!!!!!!!!!!!!! -"-
+		xor		a												; MODIF !!!!!!!!!!!!!!! RESETTING EXP IS NOT SUFFICIENT FOR FPToString (MANTISSA ALSO NEEDS TO BE ZEROED)
+		ld		b,FP_SIZE										; MODIF !!!!!!!!!!!!!!! -"-
+.loop	ldd		[hl],a											; MODIF !!!!!!!!!!!!!!! -"-
+		dec		b												; MODIF !!!!!!!!!!!!!!! -"-
+		jr		nz,.loop										; MODIF !!!!!!!!!!!!!!! -"-
+		pop 	hl												; MODIF !!!!!!!!!!!!!!! -"-
+.next															; MODIF !!!!!!!!!!!!!!! -"-
+		ld      a,e
+        ld      [outptr],a
+        ld      a,d
+        ld      [outptr+1],a
+        ld      bc,-DIGIT-1
+		add		hl,bc
+		ld		b,h
+		ld		c,l
+		ld		hl,abuf	    ;output buffer
+		ld		a,[infes]   ;output format
+		ld		[fes],a	    ;store it
+        ld      e,DIGIT
+		ld		[hl],0	    ;clear round-off overflow buffer
+		inc		hl	     	;abuf+1
+;
+nxt:	ld		a,[bc]	    ;get digit and unpack
+		ld		d,a
+		rra	
+		rra	
+		rra	
+		rra	
+		and		$0F	     	;remove bottom digit
+        ldi     [hl],a      ;store top digit in output buffer [abuf]
+		ld		a,d	     	;now get bottom digit
+		and		$0F
+        ldi     [hl],a      ;store it
+		inc		bc
+		dec		e
+        jr      nz,nxt
+
+		ld		a,[bc]
+		ld		[fsign],a   ;store sign of number
+		xor		a
+		ld		[hl],a	    ;clear round-off buffer [abuf+13] 12 digit no rnd
+		ld		hl,xsign    ;exponent sign store
+		ld		[hl],a	    ;clear xsign
+;
+fix:	inc		bc	     	;get exponent
+		ld		a,[bc]
+		or		a	     	;exponent zero?
+        jr      z,zro       ;yes
+
+		sub		128	     	;remove normalizing bias
+        jr      nz,fix2
+
+		inc		[hl]	    ;inc xsign to negative flag [1]later zero
+
+fix2:   cp      128
+        jr      c,chk13
+
+		cpl		     		;it's a negative exponent
+		inc		[hl]	    ;inc xsign to negative [1]
+zro:	inc		a
+chk13:	ld		hl,expo	    ;exponent temp store
+		ld		[hl],a
+		ld		e,a
+        cp      PRECISION
+		ld		hl,fes	    ;format temp byte
+        jr      c,chkxo
+
+chk40:	ld		a,1	     	;force exponential printout
+		or		[hl]	    ;set format for xout
+		ld		[hl],a
+;
+chkxo:	ld		a,[hl]	    ;check if exponential printout
+		rra	
+        jr      nc,chkx3
+
+		and		$0F
+        cp      PRECISION
+        jr      c,chkx2
+
+        ld      a,PRECISION-1  ;max digits
+chkx2:	ld		d,a
+		inc		a
+        jr      roundT
+;
+chkx3:	and		$0F	     	;add exponent & decimal places
+		ld		d,a
+        add     a,e
+        cp      PRECISION+1
+		ld		b,a
+        jr      c,chkxn
+
+		ld		a,[hl]
+		and		$40
+        jr      nz,chk40
+;
+chkxn:	ld	a,[xsign]    	;check exponent sign
+		or	a
+        jr      nz,xneg     ;it's negative
+
+		ld	a,b
+        jr      roundT
+;
+xneg:	ld		a,d	     	;sub exponent & decimal place count
+		sub		e
+        jr      nc,xn2
+
+xn1:	ld		a,[infes]
+        cp      128
+        jp      c,zerons
+
+		and		$0E
+        jp      z,zerons
+
+		rrca
+		ld		e,a
+		dec		e
+		ld		c,1
+		ld		hl,abuf-1
+        jr      nrnd
+
+xn2:    jr      z,xn1
+        jr      roundT
+;
+;
+clean:	ld		b,$1F	     ;clear flags
+		and		b
+        cp      PRECISION+1
+		ret		c
+
+        ld      a,PRECISION+1  ;max digits out
+		ret	
+;
+; this routine is used to round data to the
+; specified decimal place
+roundT:	call	clean
+		ld		c,a
+		ld		b,0
+		ld		hl,abuf+1
+		add		hl,bc	     ;get round-off addr
+
+        ld      a,l
+        ld      [addt],a
+        ld      a,h
+        ld      [addt+1],a
+
+		ld		a,[hl]
+		cp		5	     	;round if >=5
+        jr      c,trl1
+;
+less1:	dec		hl
+		inc		[hl]	     ;round up
+		ld		a,[hl]
+		or		a
+        jr      z,trl2
+
+		cp		10	     	;check if rounded number >9
+        jr      nz,trail
+
+		ld		[hl],0
+        jr      less1
+;
+; this routine eliminates trailing zeros
+trail:  ld      a,[addt]
+        ld      l,a
+        ld      a,[addt+1]
+        ld      h,a
+
+trl1:   dec     hl
+trl2:	ld		a,[fes]	     ;check if trailing zeros are wanted
+		rla	
+        jr      c,fprnt      ;yes, go print data
+
+trl3:	ld		a,[hl]
+		or		a	     	;is it a zero?
+        jr      nz,fprnt     ;no, go print
+
+		dec		hl
+		dec		c	     	;yes, fix output digit count
+        ld      a,c
+        cp      128
+        jp      nc,zeron     ;jump if C is negative
+
+        jr      trl3
+;
+; print format routines
+fprnt:	ld		hl,abuf
+		ld		a,[hl]	     ;check if rounded up to 1
+		or		a
+        jr      z,nrnd       ;jump if not
+
+		ld		b,1
+		ld		a,[xsign]    ;is exponent negative?
+		or		a
+        jr      z,posr
+
+		ld		b,-1
+;
+posr:	ld		a,[expo]     ;get exponent
+		or		a
+        jr      nz,po2       ;is it zero? [e+0]
+
+		ld		[xsign],a
+		ld		b,1
+po2:    add     a,b          ;fix exponent count
+		ld		[expo],a
+		inc	e
+		inc	c
+		dec	hl
+;
+nrnd:	inc		hl
+		ld		a,c
+        cp      PRECISION+1    ;check for maximum digits out
+        jr      nz,nrnd1
+
+		dec		c
+nrnd1:	ld		a,[fsign]    ;check if neg #
+		rra	
+        jr      nc,prin2     ;go output radix & number
+
+		call	neg	     	;output [-]
+        jr      pri21
+;
+prin2:	call	space	     ;output a space
+pri21:	ld		a,[fes]	     ;get output format
+		rra		     		;check if exponential output format
+        jr      c,xprin
+
+		ld		a,[xsign]    ;get exp sign
+		or		a	     	;check if neg exp
+        jr      z,posit
+
+		ld		a,c
+		or		a
+        jr      nz,prin3     ;output zero & radix & number		; MODIF !!!!!!!!!!!!!!!
+
+        jp      zerons       ;no digits after radix, output zero & done
+;
+prin3:	call	zero											; MODIF !!!!!!!!!!!!!!!
+prin4:	call	radix	     ;print decimal point
+prin6:  xor     a
+		or		e
+        jr      z,prin5      ;jump if no zeros to print
+
+		call	zero	     ;force print a zero
+		dec		e
+        jr      nz,prin6
+;
+prin5:	call	nout	     ;print ascii digit
+        jr      nz,prin5
+        jp      TermStr 
+;
+posit:	call	nout
+		dec		e	     	;bump exp count
+        jr      nz,posit
+
+		ld		a,c	     	;check if more digits to output
+		or		a
+        jp      z,TermStr    ;no, done
+        cp      128
+        jp      nc,TermStr
+
+        jr      prin4        ;now print decimal point
+;
+; exponential format output
+xprin:	call	nout
+        jr      z,ndec       ;integer?
+
+		call	radix	     ;no. print decimal point
+xpri2:	call	nout
+        jr      nz,xpri2
+;
+ndec:	ld		b,"E"	     ;print "E"							; MODIF !!!!!!!!!!!!!!!
+		call	chout
+		ld		a,[xsign]
+		or		a
+        jr      z,xpri3
+
+		call	neg	     	;print exp sign [-]
+		ld		a,[expo]
+		inc		a
+        jr      xout2
+
+xpri3:	ld		b,"+"	     ;exp [+]
+		call	chout
+;
+; convert the exponent from binary-to-ascii
+; and print the result.
+xout:	ld		a,[expo]
+		dec		a
+xout2:	ld		c,100
+		ld		d,0
+		call	conv
+		cp		"0"	     	;skip leading zeros
+        jr      z,xo21
+
+		inc		d
+		call	chout
+xo21:	ld		a,e
+		ld		c,10
+		call	conv
+		cp		"0"
+        jr      nz,xo3
+
+		dec		d
+        jr      nz,xo4
+
+xo3:	call	chout
+xo4:	ld		a,e
+        add     a,"0"          ;add ascii bias
+		ld		b,a
+        ;jp      zeroc											; MODIF !!!!!!!!!!!!!!!
+		call	chout											; MODIF !!!!!!!!!!!!!!!
+		jp		TermStr											; MODIF !!!!!!!!!!!!!!!
+;
+conv:	ld		b,"0"-1
+conv1:  inc     b
+		sub		c
+        jr      nc,conv1
+
+        add     a,c
+		ld		e,a
+		ld		a,b
+		ret	
+;
+; change bcd digit to ascii & print
+nout:	ld		a,[hl]
+        add     a,"0"
+		ld		b,a
+		call	chout
+		inc		hl
+		dec		c	     ;dec total digits printed count
+		ret	
+
+; print fp zero
+zeron:  ld      b," "
+zeroc:  call    chout
+zerons: call    zero
+        jp      TermStr
+;
+; common symbol loading routines
+neg:	ld		b,"-"
+		jp		chout
+zero:	ld		b,"0"
+		jp		chout
+space:	ld		b," "
+		jp		chout
+radix:	ld		b,"."
+		jp		chout
+
+StringToFP::
+		ld		b,0
+		ld		a,[de]
+		cp		"+"	     ;look for leading plus or minus on input
+        jr      z,stofp2
+
+		cp		"-"
+        jr      nz,stofp3
+
+		ld		b,1
+stofp2: inc		de
+stofp3: push	bc
+		push	hl
+        call    SToFP         ;input fp number
+		pop		hl
+		dec		hl
+        pop     bc
+        ld      [hl],b
+        ret
+
+; converts fp string at de, update de past terminator
+; puts terminator in b, puts fp # at addr in hl.
+; Sets carry if valid number not found.
+
+SToFP:  push    hl
+
+        ld      l,e
+        ld      h,d
+
+        dec     hl
+
+        ld      a,l
+        ld      [adds],a
+        ld      a,h
+        ld      [adds+1],a
+
+        call    ibscn           ;get first non-space
+        cp      "&"
+        jr      z,fpin6
+
+        dec     hl
+        call    ibscn2          ;add back to buffer
+        call    fpins
+        pop     hl
+        jp      nc,entr3
+        ret
+
+; get hex number from input
+
+fpin6:  call    ibscn           	;get "h"
+        cp      "h"             	;is it hex?
+        jp      nz,PopError        	;no
+
+        call    getnib
+        jp      c,PopError         	;bad hex number
+
+        ld      e,a
+        ld      d,0
+
+        ld      b,4
+fpin7:  call    getnib
+        jp      c,fpin8
+
+        dec     b
+        jp      z,PopError         ;overflow
+
+        push    hl              	;de = de * 16
+        ld      l,e
+        ld      h,d
+        add     hl,hl
+        add     hl,hl
+        add     hl,hl
+        add     hl,hl
+        ld      e,l
+        ld      d,h
+        pop     hl
+
+        add     a,e             	;add a to de
+        ld      e,a
+        ld      a,0
+        adc     a,d
+        ld      d,a
+
+        jr      fpin7
+
+fpin8:  push    hl
+
+        ld      l,e             ;put hex number in hl
+        ld      h,d
+
+        ld      de,cnsbuf       ;convert it to a ascii decimal string
+        call    cns
+        ld      a,CR
+        ld      [de],a
+
+        ld      de,cnsbuf-1
+        ld      a,e
+        ld      [adds],a
+        ld      a,d
+        ld      [adds+1],a
+        call    fpins
+        pop     de
+        pop     hl
+        push    de
+        call    entr3
+        pop     de
+        ld      a,[de]
+        ld      b,a
+        inc     de
+        or      a          		;clear carry flag
+        ret
+
+getnib: call    ibscn
+        sub     "0"
+        cp      "9"+1-"0"
+        ccf
+        ret     nc
+
+        sub     "a"-"0"
+        cp      "f"+"1"-"a"-"0"
+        ccf
+        ret     c
+        add     a,10
+        ret
+
+fpins:  push    de
+
+        xor     a
+        ld      [opst],a
+        ld      [ecnt],a
+        ld      [fsign],a
+
+        ld      hl,bcs       	;clear temporary storage areas & bc buffer
+        ld      c,DIGIT+2
+		call	clear
+
+scanc:	ld		de,0
+        ld      hl,bcs       	;bc=pack buffer
+scan0:  ld      a,l          	;pack buffer pointer
+        ld      [bcadd],a
+        ld      a,h
+        ld      [bcadd+1],a
+scanp:	ld		hl,scanp
+		push	hl	     	;used for return from other routines
+		xor		a
+		ld		[xsign],a    ;clear exp sign byte
+;
+scang:	call	ibscn
+        jr      c,scanx      ;found a #, go pack it
+		cp		"."	     	;radix?
+        jr      z,scan5      ;process radix pointers
+		cp		"E"	     	;exp?								; MODIF !!!!!!!!!!!!!!!
+		jp		z,excon	     ;found 'e', go process exp #
+
+;this char not legal in #
+		ld		b,a	     	;move terminator to b
+		ld		a,[opst]     ;check if any digits yet
+		and		$10
+		jp		nz,entr2
+
+;legal fp number not found
+fpin1:	pop		hl	     	;rid of scanp link
+        pop     de           ;text pointer
+		scf	
+		ret	
+
+;found decimal point
+scan5:	xor		a	     	;found radix process radix pointers for exp
+		or		d	     	;any digits yet?
+        jr      nz,scan6
+
+        add     a,$C0       ;set ecnt - stop counting digits
+		or		e	     	;no int digits, bit 7 is count [or don't] flag
+		ld		e,a	     	;bit 6 is negative exp flag
+		ret	
+
+scan6:	ld		a,$80	     ;set ecnt to count digits
+		or		e
+		ld		e,a
+		ret	
+;
+scanx:	and		$0F	     	;found number - remove ascii bias
+		ld		b,a
+		ld		hl,opst	     ;set first char flag
+		ld		a,$30
+		or		[hl]
+		ld		[hl],a
+		xor		a
+		or		b	     	;is char zero?
+        jr      nz,pack
+
+		or		d	     	;leading zero? ie; any int digits?
+        jr      nz,pack
+
+		or		e
+		ld		e,a
+		ret		z	     	;if counting yet,
+		inc		e	     	;ecnt+1-count zeros for exp count
+		ret	
+;
+; bcd pack digits into pair bc
+;
+pack:	ld		a,e
+		rla	
+        jr      c,pack1
+
+		inc		e
+pack1:	ld		a,e
+		ld		[ecnt],a     ;digit count for exp count
+		inc		d	     	;total digit count [d has top/bot flag bit 7]
+		ld		a,d
+		and		$7F     	;remove top/bot flag
+        cp      PRECISION+1  ;limit input digits
+		ret		nc
+
+        ld      a,d
+        cp      128
+        jr      nc,botm
+;
+top:	or		$80	     	;set msb for top flag
+        ld      d,a
+
+        ld      a,[bcadd]    ;get bc addr
+        ld      l,a
+        ld      a,[bcadd+1]
+        ld      h,a
+
+        ld      a,b
+		rlca
+		rlca	
+		rlca	
+		rlca	
+		ld		[hl],a	     ;save char in bc
+		ret	
+;
+botm:	and		$7F	     	;strip msb [bottom flag]
+		ld		d,a
+		;ld		a,b 											; MODIF !!!!!!!!!!!!!!!
+
+        ld      a,[bcadd]
+        ld      l,a
+        ld      a,[bcadd+1]
+        ld      h,a
+
+        ld      a,b
+		or		[hl]	     ;or in top number
+        ldi     [hl],a       ;put number back in bc
+		pop		bc
+		jp		scan0
+
+ibscn:  ld      a,[adds]     ;input buffer pointer
+        ld      l,a
+        ld      a,[adds+1]
+        ld      h,a
+
+ibscn1: inc     hl           ;get next byte
+		ld		a,[hl]
+		cp		" "
+        jr      z,ibscn1
+
+ibscn2: 
+		push	af												; MODIF !!!!!!!!!!!!!!!
+		ld      a,l
+        ld      [adds],a
+        ld      a,h
+        ld      [adds+1],a
+		pop		af												; MODIF !!!!!!!!!!!!!!!
+
+; check for ascii numbers
+nmchk:	cp		"9"+1
+		ret		nc
+		cp		"0"
+		ccf	
+		ret	
+;
+; adjust a number in bc buffer & return value
+entr2:	ld		de,0
+ent1:	push	bc	     	;terminator
+		call	fixe	    ;normalize floating point #
+		pop		bc	     	;terminator
+		pop		de	     	;scanp link
+		pop		de	     	;old text addr
+        or      a
+        ret
+
+entr3:  ld      e,l
+        ld      d,h
+        ld      c,DIGIT+2
+        ld      hl,bcs+DIGIT+1
+		call	vcopy
+
+        ld      a,[adds]
+        ld      l,a
+        ld      a,[adds+1]
+        ld      h,a
+
+        EXDEHL
+
+		inc		de
+		or		a
+		ret
+
+; clear storage areas
+; hl = starting address
+; c = count
+clear:	xor		a
+clear1: ldi     [hl],a
+		dec		c
+        jr      nz,clear1
+		ret	
+;
+; convert ascii exponent of number in the input buffer
+; to binary. normalize exponent according to the input
+; format of the number.
+excon:	call	ibscn	     ;get character
+        jr      c,exc3
+
+;        cp      plsrw        ;check for unary sign
+;        jr      z,exc4
+
+		cp		"+"
+        jr      z,exc4
+
+;        cp      minrw
+;        jr      z,exc2
+
+		cp		"-"
+        jr      nz,fperr     ;no sign or number?
+
+exc2:	ld		a,1
+		ld		[xsign],a    ;save sign
+exc4:	call	ibscn
+        jr      nc,fperr     ;no number?
+
+exc3:	call	ascdc	     ;convert ascii to binary
+        jr      ent1         ;normalize # & return
+;
+; convert ascii to binary
+; three consecutive numbers <128 may be converted
+ascdc:  EXDEHL
+
+		ld		hl,0
+asc1:	ld		a,[de]	     ;get chr from input buffer, no spaces allowed
+		call	nmchk	     ;check if #
+        jr      nc,asc2
+		sub		"0"	     	;remove ascii bias
+		ld		b,h
+		ld		c,l
+		add		hl,hl
+		add		hl,hl
+		add		hl,bc
+		add		hl,hl
+		ld		c,a
+		ld		b,0
+		add		hl,bc
+		inc		de
+        jr      asc1
+
+asc2:   EXDEHL
+
+		ld		b,a	     	;save terminator
+
+        ld      a,l
+        ld      [adds],a     ;save ibuf addr
+        ld      a,h
+        ld      [adds+1],a
+
+		ld		a,d
+		or		a
+        jr      nz,fperr     ;too big >255
+
+		ld		a,e
+		;rla													; MODIF !!!!!!!!!!!!!!!
+		cp		a,126											; MODIF !!!!!!!!!!!!!!!
+        ;jr      c,fperr      ;too big >127						; MODIF !!!!!!!!!!!!!!!
+		jr      nc,fperr      ;too big >126						; MODIF !!!!!!!!!!!!!!!
+		;rra													; MODIF !!!!!!!!!!!!!!!
+		ret	
+
+fperr:	pop		bc	     	;ascdc ret link
+		jp		fpin1
+;
+; normalize input buffer
+fixe:   EXDEHL
+
+        ld      a,[bcs]
+		or		a	     	;is it zero?
+        jr      z,zz2
+
+		call	chkpn	     ;set exp pos/neg
+        add     a,$80          ;add exp bias
+zz2:    ld      [bcs+DIGIT+1],a;store normalized exp in bc
+		ret	
+;
+chkpn:	ld		a,[ecnt]     ;get exp count-set in "scan" routine
+		ld		e,a
+		and		$3F	     	;strip bits 7&8
+		ld		b,a
+		ld		a,[xsign]
+		or		a
+        jr      z,lpos       ;exponent is positive
+
+		inc		h	     	;set sign in h
+		ld		a,$40	     ;l is neg
+		and		e	     	;check if e is negative
+        jr      z,epos
+
+		ld		a,l	     	;both e&l neg
+		ld		l,b
+        call    bpos1											; MODIF !!!!!!!!!!!!!!!
+        ;jr		bpos1											; MODIF !!!!!!!!!!!!!!!
+		cpl	
+		inc		a
+		ret		     		;back to fixe
+;
+epos:	ld		a,l	     	;e&l neg
+epos1:  cpl 
+		inc		a
+        add     a,b
+		ret		     		;to fixe
+;
+lpos:	ld		a,$40	     ;exponent positive
+		and		e	     	;is e negative?
+        jr      z,bpos
+
+		ld		a,b
+		ld		b,l
+        jr      epos1
+;
+bpos:	ld		a,b	     	;e&l pos
+bpos1:  add     a,l
+        ;cp		128												; MODIF !!!!!!!!!!!!!!!
+		cp      126												; MODIF !!!!!!!!!!!!!!!
+        ret     c
+
+		pop		hl
+		pop		af												; MODIF !!!!!!!!!!!!!!!
+        jr      fperr
+;
+; convert integer to string
+; de = addr of string
+; hl = value to convert
+; exit:	de = updated value
+;
+cns:
+		xor		a	     	;set for no leading zeroes
+		ld		bc,-10000
+		call	rsub
+		ld		bc,-1000
+		call	rsub
+		ld		bc,-100
+		call	rsub
+		ld		bc,-10
+		call	rsub
+		ld		bc,-1
+		call	rsub
+		ret		nz
+		ld		a,"0"
+		ld		[de],a
+		inc		de
+		ret	
+;
+; Take value in hl sub # in bc the
+; most possible times.
+; Put value on string at de.
+; If a=0 then don't put zero on string.
+; Return non-zero if a put on string
+;
+rsub:	push	de
+		ld		d,-1
+rsub1:  ld      a,l
+        ld      [miscW1],a
+        ld      a,h
+        ld      [miscW1+1],a
+        inc     d
+        add     hl,bc
+        jr      c,rsub1
+
+        ld      a,[miscW1]
+        ld      l,a
+        ld      a,[miscW1+1]
+        ld      h,a
+		ld		b,d
+		pop		de
+		or		b	     		;a gets 0 if a was 0 and b is 0
+		ret		z
+
+		ld		a,"0"
+        add     a,b
+		ld		[de],a
+		inc		de
+		ret	
+
+;       Four Function Floating Point BCD
+;
+;		bc = de # hl
+;	      # is +,-,*, or /.
+;	<bc>=address of result
+;	<de>=address of 1st argument
+;	<hl>=address of 2nd argument
+; All addresses on entry point to the exponent part of #.
+; Each # consists of PRECISION packed decimal digits,
+; a sign, and a biased binary exponent. The exponent range
+; is 10**-127 to 10**127. The number 0 is represented by
+; the exponent 0. Positive numbers are indicated by the
+; sign 0, negative numbers have a sign 1. The numbers are
+; stored in memory as two BCD digits per byte starting at
+; the low order address. All numbers are assumed to be normalized.
+
+;
+;	floating point addition
+;
+fadd:	push	bc
+		call	expck	     ;fetch arguments
+		ld		c,0
+adsum:	dec		de
+
+        EXDEHL
+
+        ld		a,[sign]
+		xor		[hl]	     ;form sign of result
+		ld		b,a
+
+        EXDEHL
+
+		ld		a,[de]
+		dec		de
+		xor		c
+		ld		[sign],a
+		ld		hl,rctrl     ;rounding control flag
+        ldi     a,[hl]
+		or		a
+		ld		a,[hl]	     ;get rounding digit
+        jr      z,ads8
+
+		rlca
+		rlca	
+		rlca	
+		rlca	
+ads8:   add     a,$B0       ;force carry if digit > 5
+		ld		a,b
+		rra	
+        jr      c,ads1       ;have sub
+
+		rla		     		;restore carry
+		call	add0	     ;perform addition
+        jr      nc,ads2
+
+		ld		b,4
+		call	right
+		ld		hl,exp
+		inc		[hl]	     ;inc exp
+		jp		z,over
+
+ads2:	pop		bc	     	;get results addr
+        jp      store        ;save results
+
+zerex:	pop		hl
+        jr      ads2
+
+add0:   ld      hl,buf+DIGIT-1
+        ld      b,DIGIT
+add1:	ld		a,[de]
+        adc     a,[hl]
+		daa	
+        ldd     [hl],a
+		dec		de
+		dec		b
+        jr      nz,add1
+
+		ret		nc
+		inc		[hl]
+		ret	
+;
+;	floating point subtraction
+;
+fsub:	push	bc
+		call	expck	     ;get arguments
+		ld		a,[sign]
+		xor		1	     	;complement sign
+		ld		[sign],a
+        jr      adsum
+
+ads1:	rla		     		;restore carry
+		ccf		     		;complement for rounding
+		call	sub0	     ;subtract arguments
+		ld		hl,sign
+        jr      c,ads4
+
+		ld		a,[hl]	     ;get sign
+		xor		1	     	;complement
+		ld		[hl],a
+ads7:	dec		hl
+        ld      b,DIGIT
+ads3:	ld		a,$9A
+        sbc     a,[hl]       ;complement result
+        add     a,0
+		daa	
+        ldd     [hl],a
+		dec		b
+		ccf	
+        jr      nz,ads3
+
+ads4:	ld		hl,buf
+        ld      bc,DIGIT
+ads5:	ld		a,[hl]
+		or		a
+        jr      nz,ads6
+
+		inc		hl
+		inc		b
+		inc		b
+		dec		c
+        jr      nz,ads5
+
+		xor		a
+		ld		[exp],a
+        jr      ads2
+
+ads6:	cp		$10
+        jr      nc,ads9
+
+		inc		b
+ads9:	ld		hl,exp
+		ld		a,[hl]
+		sub		b
+		jp		z,under
+		jp		c,under
+
+		ld		[hl],a
+		ld		a,b
+		rlca	
+		rlca	
+		ld		b,a
+		call	left
+		jr      ads2
+
+sub0:   ld      hl,buf+DIGIT-1
+        ld      b,DIGIT
+sub1:	ld		a,$99
+        adc     a,0
+		sub		[hl]
+
+        EXDEHL
+
+        add     a,[hl]
+		daa
+
+        EXDEHL
+
+        ldd     [hl],a
+		dec		de
+		dec		b
+        jr      nz,sub1
+		ret	
+;
+;	floating point multiply
+;
+fmul:	push	bc
+		ld		a,[hl]
+		or		a	     	;argument = 0?
+        jr      z,fmul1+2
+
+		ld		a,[de]
+		or		a	     	;argument = 0?
+        jr      z,fmul1+2
+
+        add     a,[hl]       ;form result exponent
+        jr      c,fmovr
+        cp      128
+        jp      c,under         ;jump if A is positive
+
+        jr      fmul1
+
+fmovr:
+        cp      128
+        jp      nc,over
+
+fmul1:	sub		128	     	;remove excess bias
+		ld		[exp],a	     ;save exponent
+		dec		de
+		dec		hl
+		ld		a,[de]
+
+		xor		[hl]	     ;form result sign
+		dec		hl
+		dec		de
+		push	hl
+		ld		hl,sign	     ;get sign addr
+        ldd     [hl],a       ;save sign
+		xor		a
+        ld      b,DIGIT+2
+fmul2:  ldd     [hl],a       ;zero working buffer
+		dec		b
+        jr      nz,fmul2
+
+		ld		a,[exp]
+		or		a
+		jp		z,zerex
+
+        ld      c,DIGIT
+        ld      hl,hold1+DIGIT
+; get multiplier into holding register
+fmul3:	ld		a,[de]
+        ldd     [hl],a       ;put in register
+		dec		de
+		dec		c
+        jr      nz,fmul3
+
+		ld		[hl],c
+		dec		hl
+
+		ld		b,250	     ;set loop count
+fmul4:  ld      de,DIGIT+1
+		ld		c,e
+		add		hl,de
+
+    EXDEHL
+
+		add		hl,de	     ;hl=next holding register
+		inc		b
+        ld      a,b
+        cp      128												; !!!!! IT WILL EXIT WHEN b=0 !!!!!
+        jr      c,fmul8      ;finished
+
+fmul5:	ld		a,[de]	     ;get digits
+        adc     a,a          ;times 2
+		daa	
+        ldd     [hl],a       ;put in holding register
+		dec		de
+		dec		c
+        jr      nz,fmul5
+
+		inc		b	     	;inc loop count
+        jr      nz,fmul4
+
+; form 10x by adding 8x & 2x
+; first get 8x
+
+		inc		hl
+		ld		de,hold5     ;next holding register
+        ld      c,DIGIT+1
+		ld		b,c
+fmul6:  ldi     a,[hl]
+		ld		[de],a
+		inc		de
+		dec		c
+        jr      nz,fmul6
+
+        ld      hl,hold2+DIGIT  ;get 2x
+		dec		de
+fmul7:	ld		a,[de]
+        adc     a,[hl]          ;form 10x
+		daa	
+		ld		[de],a
+		dec		de
+		dec		hl
+		dec		b
+        jr      nz,fmul7
+
+		ld		b,249
+
+        EXDEHL
+
+        jr      fmul4
+
+fmul8:  EXDEHL
+
+		inc	hl
+
+        ld      [hl],DIGIT+1 ;set next loop count
+; perform accumulation of product
+fmul9:	pop		bc	     	;get multiplier						; !!!!! POINTS TO LSB OF MANTISSA !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        ld      hl,hold8+DIGIT+1
+		dec		[hl]	     ;dec loop count
+        jr      z,fmu14      ;finished
+
+		ld		a,[bc]
+		dec		bc
+		push	bc
+		dec		hl												; !!!!! POINTS TO LSB OF HOLD8 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+        EXDEHL
+
+fmu10:  add     a,a          ;check for bit in carry
+        jr      c,fmu11      ;found a bit
+        jr      z,fmu12      ;zero, finished this digit
+
+        ld      hl,-DIGIT-1
+		add		hl,de	     ;point to next holding register
+
+        EXDEHL
+
+        jr      fmu10
+
+fmu11:	ld		c,a
+		or		a	     	;clear carry
+		call	add0	     ;accumulate product
+		ld		a,[de]
+        add     a,[hl]
+		daa	
+		ld		[hl],a
+		ld		a,c
+		dec		de
+        jr      fmu10
+
+; rotate right 1 byte
+fmu12:	ld		b,8
+		call	right
+        jr      fmul9
+
+fmu14:	ld		a,[buf]
+		and		$F0	     	;check if normalized
+        jr      z,fmu17
+
+		ld		a,d
+		and		$F0
+		ld		hl,sign-1
+        jr      fmu18
+
+fmu17:	ld		b,4
+		ld		hl,exp
+		dec		[hl]
+		jp		z,under
+
+		call	left	     ;normalize
+		ld		a,d	     	;get digit shifted off
+; perform rounding
+		rrca	
+		rrca	
+		rrca	
+		rrca	
+fmu18:	cp		$50
+        jr      c,fmu16
+
+		inc		a
+		and		$0F
+        ld      c,DIGIT
+fmu15:  adc     a,[hl]
+		daa	
+        ldd     [hl],a
+		ld		a,0
+		dec		c
+        jr      nz,fmu15
+
+; check for rounding overflow
+		jp		nc,ads2	     ;no overflow
+
+		inc		hl
+		ld		[hl],$10
+		ld		hl,exp
+		inc		[hl]
+		jp		nz,ads2
+		jp		over
+
+; rounding not needed
+fmu16:	and		$0F
+        add     a,[hl]
+		ld		[hl],a
+		jp		ads2
+
+;
+;	floating point division
+;
+fdiv:	push	bc
+		ld		a,[hl]	     ;fetch divisor exp
+		or		a	     	;divide by 0?
+		jp		z,divz
+
+		ld		a,[de]
+		or		a	     	;dividend = 0?
+		jp		z,insp
+
+		sub		[hl]
+        jr      c,divun
+        cp      128
+        jp      nc,over
+        jr      fdi1
+
+divun:  cp      128
+        jp      c,under         ;jump if positive
+
+fdi1:   add     a,129        ;form quotient exp
+		ld		[expd],a
+
+        EXDEHL
+
+		push	de
+		call	load0	     ;fetch dividend					; MODIF !!!!!!!!!!!!!!! (RGBDS 0.4.1 COMPATIBILITY)
+		pop		de
+
+        EXDEHL
+
+		ld		a,[sign]
+		dec		hl
+		xor		[hl]	     ;form quotient sign
+		ld		[signd],a
+
+        EXDEHL
+
+		dec		de
+		ld		bc,hold1
+div0:   ld      l,PRECISION
+div1:	push	bc
+		push	hl
+		ld		c,0	     ;quotient digit = 0
+div3:	scf		     	;set carry
+        ld      hl,buf+DIGIT-1
+        ld      b,DIGIT
+div4:	ld		a,$99
+        adc     a,0
+
+        EXDEHL
+
+		sub		[hl]
+
+        EXDEHL
+
+        add     a,[hl]
+		daa	
+        ldd     [hl],a
+		dec		de
+		dec		b
+        jr      nz,div4
+
+		ld		a,[hl]
+		ccf	
+        sbc     a,0
+		ld		[hl],a
+		rra	
+        ld      hl,DIGIT
+		add		hl,de
+
+        EXDEHL
+
+		inc		c	     	;inr quotient
+		rla	
+        jr      nc,div3
+
+		or		a	     	;clear carry
+		call	add0	     ;restore dividend
+        ld      hl,DIGIT
+		add		hl,de
+
+        EXDEHL
+
+		push	bc
+		ld		b,4
+		call	left	     ;shift dividend
+		pop		bc
+		dec		c
+		pop		hl
+		ld		h,c
+		pop		bc
+		ld		a,l
+        jr      nz,div5
+
+        cp      PRECISION
+        jr      nz,div5
+
+		ld		hl,expd
+		dec		[hl]
+		call	z,under
+        jr      div0
+
+div5:	rra
+		ld		a,h
+        jr      nc,div6
+
+		ld		a,[bc]
+		rlca	
+		rlca	
+		rlca	
+		rlca	
+        add     a,h
+		ld		[bc],a	     ;store quotient
+		inc		bc
+        jr      div7
+
+div6:	ld		[bc],a	     ;store quotient
+div7:	dec		l	     	;dec digit count
+        jr      nz,div1
+
+		ld		hl,expd
+		pop		bc
+        jr      storo
+
+; fetch & align arguments for
+; addition & subtraction
+expck:	ld		a,[de]
+		sub		[hl]	     ;difference of exps
+		ld		c,0
+        jr      nc,expc1
+
+		inc		c
+
+        EXDEHL
+
+		cpl	
+		inc		a
+expc1:	ld		b,a
+		ld		a,[de]
+		ld		[exp],a
+		ld		a,b
+        cp      PRECISION
+        jr      c,expc2
+
+        ld      a,PRECISION
+expc2:	rlca	
+		rlca	
+		ld		b,a
+		and		4
+		ld		[rctrl],a    ;set rounding control
+		push	bc
+		push	de
+		call	load0	     ;load smaller value				; MODIF !!!!!!!!!!!!!!! load0 was load (RGBDS 0.4.1 COMPATIBILITY)
+        ld      a,8*DIGIT+16
+		sub		b
+        cp      8*DIGIT+16
+        jr      z,expc3
+
+		and		$F8
+		rra	
+		rra	
+		rra	
+        add     a,e
+		ld		e,a
+		ld		a,d
+        adc     a,0
+		ld		d,a
+		ld		a,[de]	     ;get rounding digit
+		ld		[rdigi],a    ;save
+expc3:	call	right	     ;align values
+		pop		de
+		pop		bc
+		ret	
+
+; load argument into buffer
+load0:	ld      de,sign											; MODIF !!!!!!!!!!!!!!! load0 was load (RGBDS 0.4.1 COMPATIBILITY)
+        ld      c,DIGIT+1
+        dec     hl
+load1:  ldd     a,[hl]
+        ld      [de],a
+        dec     de
+        dec     c
+        jr      nz,load1
+
+        xor     a
+        ld      [de],a
+        dec     de
+        ld      [de],a
+        ld      [rdigi],a    ;zero rounding digit
+        ret 
+
+; store results in memory
+store:  ld      hl,exp
+storo:  ld      e,DIGIT+2
+stor1:  ldd     a,[hl]
+		ld		[bc],a
+		dec		bc
+		dec		e
+        jr      nz,stor1
+		and		a												; MODIF !!!!!!!!!!!!!!!!!!!!!!! : resets carry flag (carry flag =0 means no error in calculation info needed by fpetst)
+		ret	
+
+; shift right number of digits in b/4
+right:  ld      c,DIGIT+1
+righ1:	ld		hl,buf-1
+		ld		a,b
+		sub		8	     	;check if byte can be shifted
+        jr      nc,righ3
+
+		dec		b
+        push    af
+        ld      a,b
+        cp      128
+        jr      c,righ5
+
+        pop     af
+        ret
+
+righ5:
+        pop     af
+
+		or		a
+righ2:	ld		a,[hl]
+		rra	
+        ldi     [hl],a
+		dec		c
+        jr      nz,righ2
+        jr      right
+
+; shift right one byte
+righ3:	ld		b,a
+		xor		a
+righ4:	ld		d,[hl]
+        ldi     [hl],a
+		ld		a,d
+		dec		c
+        jr      nz,righ4
+        jr      right
+
+; shift left number of digits in b/4
+left:   ld      c,DIGIT+1
+		ld		hl,sign-1
+lef1:	ld		a,b
+		sub		8
+        jr      nc,lef3
+
+		dec	b
+        push    af
+        ld      a,b
+        cp      128
+        jr      c,lef5
+
+        pop     af
+        ret
+
+lef5:
+        pop     af
+
+		or		a
+lef2:	ld		a,[hl]
+		rla	
+        ldd     [hl],a
+		dec		c
+        jr      nz,lef2
+        jr      left
+
+; shift left one byte
+lef3:	ld		b,a
+		xor		a
+lef4:	ld		d,[hl]
+        ldd     [hl],a
+		ld		a,d
+		dec		c
+        jr      nz,lef4
+        jr      left
+
+; set flags for overflow, underflow
+; and divide by zero
+over:
+		;jp      Error											; MODIF !!!!!!!!!!!!!!!
+		jp      PopError										; MODIF !!!!!!!!!!!!!!!
+
+under:  ld      a,$FF
+		ld		[erri],a
+insp:	inc		sp
+		inc		sp
+		ret	
+
+divz:
+		;jp      Error											; MODIF !!!!!!!!!!!!!!!
+		jp      PopError										; MODIF !!!!!!!!!!!!!!!
+
+
+
+;
+;***** Floating Point Constants *****
+;
+; Note: If floating point precision is changed
+;       the following table MUST be modified as well.
+
+;
+;	sine coefficient list
+;
+        DB    -1           ;marks end of sine coefficient list
+        DB    0
+
+        DB    $10
+        DB    $00
+        DB    $00
+        DB    $00
+		DB    $00
+		DB    0
+fpone:: DB    128+1        ;.1000000000 e 1
+
+        DB    $16
+        DB    $66
+        DB    $66
+		DB    $66
+		DB    $67
+        DB    1
+        DB    128          ;-.1666666667 e 0 (-1/3!)
+
+        DB    $83
+        DB    $33
+		DB    $33
+        DB    $33		
+        DB    $33
+        DB    0
+        DB    128-2        ;.8333333333 e-2 (1/5!)
+
+        DB    $19
+        DB    $84
+        DB    $12
+        DB    $69		
+        DB    $84		
+        DB    1
+		DB    128-3        ;-.1984126984 e-3 (-1/7!)
+
+        DB    $27
+        DB    $55
+        DB    $73
+        DB    $19		
+        DB    $22		
+        DB    0
+        DB    128-5        ;.2755731922 e-5 (1/9!)
+
+        DB    $25
+        DB    $05
+        DB    $21
+        DB    $08		
+        DB    $39		
+        DB    1
+sinx:   DB    128-7        ;-.2505210839 e-7 (-1/11!)
+
+;
+;	cosine coefficient list
+;
+        DB    -1           ;marks end of cosine coefficient list
+        DB    0
+
+        DB    $10
+        DB    $00
+        DB    $00
+        DB    $00		
+        DB    $00		
+        DB    0
+        DB    128+1        ;.1000000000 e 1 (1/1!)
+
+        DB    $50
+        DB    $00
+        DB    $00
+        DB    $00		
+        DB    $00		
+        DB    1
+matub:  DB    128          ;-.5000000000 e 0 (-1/2!)
+
+        DB    $41
+		DB    $66        
+		DB    $66		
+		DB    $66
+        DB    $67
+        DB    0
+rands:  DB    128-1        ;.4166666667 e-1 (1/4!)
+
+        DB    $13
+        DB    $88
+        DB    $88
+        DB    $88
+        DB    $89
+        DB    1
+        DB    128-2        ;.1388888889 e-2 (-1/6!)
+
+        DB    $24
+        DB    $80
+        DB    $15
+        DB    $87
+        DB    $30
+        DB    0
+        DB    128-4        ;.2480158730 e-4 (1/8!)
+
+        DB    $27
+        DB    $55
+        DB    $73
+        DB    $19		
+        DB    $22		
+        DB    1
+cosx:   DB    128-6        ;.2755731922 e-6 (-1/10!)
+
+        DB    $10
+        DB    $00
+        DB    $00
+        DB    $00		
+        DB    $00		
+        DB    1
+fpnone: DB    128+1        ;-1.0
+
+        DB    $20
+        DB    $00
+        DB    $00
+        DB    $00		
+        DB    $00		
+        DB    0
+fptwo:  DB    128+1        ;2.0
+
+        DB    $15
+        DB    $70
+        DB    $79
+        DB    $63		
+        DB    $27		
+        DB    0
+pic2:   DB    128+1        ;pi/2 .1570796327 e 1
+
+        DB    $63
+        DB    $66
+        DB    $19
+        DB    $77		
+        DB    $24		
+        DB    0
+pic1:   DB    128          ;2/pi .6366197724 e 0
+
+;lcstka: .word    cstkl
+
+        DB    $13
+        DB    $10
+        DB    $72
+        DB    $00		
+        DB    $00	
+        DB    0
+snd2:   DB    128+6        ;131072.0
+
+
+
+
+
+
+
+
+
+
+
+
+
