@@ -4,7 +4,7 @@ Floating Point Arithmetic for GameBoy
 Hi, this is a debugged version of float point arithmetic for GameBoy, originally published by Jeff Frohwein
 
 I have added CALCULATOR.gb rom. This is a calcuculator (to be runned on a gameboy or a gameboy emulator)
-that I created and used to test the arithmetic functions
+that I created and used for testing the arithmetic functions
 
 enjoy !
 
